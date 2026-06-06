@@ -8,7 +8,6 @@ import { pathToFileURL } from "node:url";
 
 import express from "express";
 import httpProxy from "http-proxy";
-import pty from "node-pty";
 import {
   canServeGatewayRequest,
   describeGatewayHealth,
@@ -129,20 +128,6 @@ function stripAnsi(value) {
   return String(value)
     .replace(/\x1b\]8;;.*?\x1b\\|\x1b\]8;;\x1b\\/g, "")
     .replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]/g, "");
-}
-
-function isTransientProgressLine(line) {
-  return /^[\s◐◓◑◒⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏.-]*(Requesting device code|Waiting for device authorization|Exchanging device code)/.test(
-    line,
-  );
-}
-
-function cleanPtyOutput(value) {
-  const cleaned = stripAnsi(value)
-    .split(/\r|\n/)
-    .filter((line) => line && !isTransientProgressLine(line))
-    .join("\n");
-  return cleaned ? `${cleaned}\n` : "";
 }
 
 let deviceBootstrapSdkPromise = null;
@@ -868,20 +853,7 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   });
 });
 
-function requiresInteractiveOnboarding(payload) {
-  return [
-    "openai-codex-device-code",
-    "xai-device-code",
-  ].includes(payload.authChoice);
-}
-
-function interactiveOnboardingLabel(payload) {
-  if (payload.authChoice === "xai-device-code") return "xAI device code";
-  return "OpenAI Codex device pairing";
-}
-
 function buildOnboardArgs(payload) {
-  const interactive = requiresInteractiveOnboarding(payload);
   const args = [
     "onboard",
     "--accept-risk",
@@ -899,20 +871,9 @@ function buildOnboardArgs(payload) {
     OPENCLAW_GATEWAY_TOKEN,
     "--flow",
     "quickstart",
+    "--non-interactive",
+    "--json",
   ];
-
-  if (interactive) {
-    args.push(
-      "--mode",
-      "local",
-      "--skip-channels",
-      "--skip-skills",
-      "--skip-search",
-      "--skip-ui",
-    );
-  } else {
-    args.push("--non-interactive", "--json");
-  }
 
   if (payload.authChoice) {
     args.push("--auth-choice", payload.authChoice);
@@ -1010,59 +971,6 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
-function runPtyCmd(cmd, args, opts = {}) {
-  return new Promise((resolve) => {
-    let out = "";
-    const autoInputs = opts.autoInputs ?? [];
-    const sentAutoInputs = new Set();
-    let proc;
-    try {
-      proc = pty.spawn(cmd, args, {
-        name: "xterm-color",
-        cols: 100,
-        rows: 30,
-        cwd: opts.cwd ?? process.cwd(),
-        env: {
-          ...process.env,
-          OPENCLAW_STATE_DIR: STATE_DIR,
-          OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-          // Force OpenClaw's local device-code branch so Railway setup can show
-          // the short code in the web UI instead of hiding it as remote-only.
-          DISPLAY: process.env.DISPLAY || ":0",
-          WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || "wayland-0",
-          SSH_CLIENT: "",
-          SSH_TTY: "",
-          SSH_CONNECTION: "",
-          FORCE_COLOR: "0",
-          NO_COLOR: "1",
-        },
-      });
-    } catch (err) {
-      out += `\n[spawn error] ${String(err)}\n`;
-      opts.onOutput?.(out);
-      resolve({ code: 127, output: out });
-      return;
-    }
-
-    proc.onData((data) => {
-      const chunk = opts.cleanOutput ? cleanPtyOutput(data) : stripAnsi(data);
-      if (!chunk) return;
-      out += chunk;
-      for (const { input, pattern } of autoInputs) {
-        const key = String(pattern);
-        if (sentAutoInputs.has(key) || !pattern.test(out)) continue;
-        sentAutoInputs.add(key);
-        proc.write(input);
-      }
-      opts.onOutput?.(chunk);
-    });
-
-    proc.onExit(({ exitCode }) => {
-      resolve({ code: exitCode ?? 0, output: out });
-    });
-  });
-}
-
 const VALID_AUTH_CHOICES = [
   "apiKey",
   "openai-api-key",
@@ -1116,12 +1024,21 @@ const VALID_AUTH_CHOICES = [
   "custom-api-key",
 ];
 
+// Auth methods that rely on an interactive device-code / browser login. These
+// can't be driven from the web wizard — direct the operator to run
+// `openclaw wizard` from the Railway console instead.
+const RAILWAY_CONSOLE_AUTH_CHOICES = [
+  "openai-codex",
+  "openai-codex-device-code",
+  "xai-device-code",
+];
+
 function validatePayload(payload) {
   if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     return `Invalid authChoice: ${payload.authChoice}`;
   }
-  if (payload.authChoice === "openai-codex") {
-    return "OpenAI Codex browser login needs redirect-url input in an interactive terminal. Choose OpenAI Codex device pairing in web setup.";
+  if (RAILWAY_CONSOLE_AUTH_CHOICES.includes(payload.authChoice)) {
+    return "This login uses an interactive device-code flow that the web setup can't run. Open the Railway console and run `openclaw wizard` to complete it, then return here.";
   }
   const stringFields = [
     "telegramToken",
@@ -1172,19 +1089,11 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     });
 
     const onboardArgs = buildOnboardArgs(payload);
-    const interactive = requiresInteractiveOnboarding(payload);
-    stream(
-      interactive
-        ? `Starting ${interactiveOnboardingLabel(payload)}. Use the URL and code below, then keep this page open until it completes.\n\n`
-        : "Starting OpenClaw onboarding...\n\n",
-    );
+    stream("Starting OpenClaw onboarding...\n\n");
 
-    const onboardRunner = interactive ? runPtyCmd : runCmd;
-    const onboard = await onboardRunner(OPENCLAW_NODE, clawArgs(onboardArgs), {
+    const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs), {
       onOutput: stream,
-      cleanOutput: interactive,
-      stripOutput: !interactive,
-      autoInputs: interactive ? [{ pattern: /Enable hooks\?/, input: " \r" }] : [],
+      stripOutput: true,
     });
 
     const ok = onboard.code === 0 && isConfigured();

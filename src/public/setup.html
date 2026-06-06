@@ -29,9 +29,6 @@
       slackAppToken: '',
       model: '',
       log: '',
-      loginUrl: '',
-      loginCode: '',
-      loginLabel: 'Device Login',
       setupError: '',
       setupStreamTail: '',
       loading: false,
@@ -71,15 +68,17 @@
         ].includes(this.selectedAuth);
       },
 
+      get isDeviceCode() {
+        return [
+          'openai-codex',
+          'openai-codex-device-code',
+          'xai-device-code'
+        ].includes(this.selectedAuth);
+      },
+
       get authGuidance() {
-        if (this.selectedAuth === 'openai-codex-device-code') {
-          return 'Run setup, then open the ChatGPT/Codex URL and enter the device code shown in the log.';
-        }
-        if (this.selectedAuth === 'xai-device-code') {
-          return 'Run setup, then open the xAI URL and enter the device code shown in the log. Use an eligible SuperGrok or X Premium account.';
-        }
-        if (this.selectedAuth === 'openai-codex') {
-          return 'Browser login needs an interactive terminal to paste the redirect URL. Device pairing is recommended here.';
+        if (this.isDeviceCode) {
+          return 'This login uses an interactive device-code flow that the web setup can\'t run. Open the Railway console and run `openclaw wizard` to complete it, then return here.';
         }
         if (!this.authRequiresSecret) {
           return 'No API key is needed for this auth method.';
@@ -137,9 +136,10 @@
       },
 
       async runSetup() {
-        this.loginUrl = '';
-        this.loginCode = '';
-        this.loginLabel = this.loginLabelForAuth(this.selectedAuth);
+        if (this.isDeviceCode) {
+          this.setupError = 'This login must be completed from the Railway console with `openclaw wizard`.';
+          return;
+        }
         this.setupError = '';
         this.setupStreamTail = '';
         const payload = {
@@ -200,26 +200,7 @@
         this.log += chunk;
         const scanText = this.setupStreamTail + chunk;
         this.setupStreamTail = scanText.slice(-1000);
-        this.extractLoginDetails(scanText);
         this.extractSetupFailure(scanText);
-      },
-
-      extractLoginDetails(text) {
-        const urlMatch = text.match(/https:\/\/auth\.openai\.com\/codex\/device[^\s)]*/)
-          || text.match(/\bURL:\s*(https:\/\/(?:auth|accounts)\.x\.ai\/[^\s)]*)/)
-          || text.match(/\bOpen(?: manually)?:\s*(https:\/\/(?:auth|accounts)\.x\.ai\/[^\s)]*)/);
-        if (urlMatch) this.loginUrl = urlMatch[0];
-        if (urlMatch && urlMatch[1]) this.loginUrl = urlMatch[1];
-
-        const codeMatches = [...text.matchAll(/\bCode:\s*([A-Z0-9][A-Z0-9-]{3,})\b/g)];
-        const visibleCode = codeMatches.map(m => m[1]).find(code => code !== 'shown');
-        if (visibleCode) this.loginCode = visibleCode;
-      },
-
-      loginLabelForAuth(auth) {
-        if (auth === 'xai-device-code') return 'xAI Login';
-        if (auth === 'openai-codex-device-code') return 'ChatGPT Login';
-        return 'Device Login';
       },
 
       extractSetupFailure(text) {
@@ -856,8 +837,14 @@ openclaw models set anthropic/claude-sonnet-4-20250514</code></pre>
             </dl>
           </div>
 
+          <div x-show="isDeviceCode" class="setup-error-panel">
+            This login uses an interactive device-code flow that the web setup can't run.
+            Open the Railway console and run <code class="code-inline">openclaw wizard</code> to
+            complete it, then return here. Pick a different auth method to continue in the wizard.
+          </div>
+
           <div class="btn-row">
-            <button @click="runSetup()" :disabled="loading" class="btn btn-primary">
+            <button @click="runSetup()" :disabled="loading || isDeviceCode" class="btn btn-primary">
               <span x-show="!loading">Run Setup</span>
               <span x-show="loading" style="display:inline-flex;align-items:center;gap:0.5rem">
                 <svg class="spinner-inline" fill="none" viewBox="0 0 24 24"><circle style="opacity:0.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:0.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
@@ -867,14 +854,6 @@ openclaw models set anthropic/claude-sonnet-4-20250514</code></pre>
             <button @click="resetSetup()" :disabled="loading" class="btn btn-ghost">
               Reset
             </button>
-          </div>
-
-          <div x-show="loginUrl || loginCode" class="login-code-panel">
-            <div>
-              <p class="login-code-label" x-text="loginLabel"></p>
-              <a x-show="loginUrl" :href="loginUrl" target="_blank" rel="noopener noreferrer" class="login-code-url" x-text="loginUrl"></a>
-            </div>
-            <div x-show="loginCode" class="login-code-value" x-text="loginCode"></div>
           </div>
 
           <div x-show="setupError" class="setup-error-panel" x-text="setupError"></div>
