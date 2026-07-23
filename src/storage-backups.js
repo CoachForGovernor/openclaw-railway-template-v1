@@ -57,7 +57,7 @@ export function isBackupName(name) {
     name.length < 1 ||
     name.length > 240 ||
     path.basename(name) !== name ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)
+    !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(name)
   ) {
     return false;
   }

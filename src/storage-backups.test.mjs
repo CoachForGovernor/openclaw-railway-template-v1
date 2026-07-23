@@ -42,6 +42,12 @@ function createFixture() {
 
 test("validates and classifies backup names", () => {
   assert.equal(isBackupName("openclaw-critical-2026.tar.gz"), true);
+  assert.equal(
+    isBackupName(
+      "2026-07-23T04-10-30.694+00-00-openclaw-backup.tar.gz",
+    ),
+    true,
+  );
   assert.equal(isBackupName("../escape.tar.gz"), false);
   assert.equal(isBackupName("backup.partial"), false);
   assert.equal(classifyBackupName("openclaw-critical-2026.tar.gz"), "critical");
