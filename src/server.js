@@ -23,6 +23,26 @@ const WORKSPACE_DIR =
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+const GOOGLE_DRIVE_CLIENT_ID = process.env.GOOGLE_DRIVE_CLIENT_ID?.trim();
+const GOOGLE_DRIVE_CLIENT_SECRET =
+  process.env.GOOGLE_DRIVE_CLIENT_SECRET?.trim();
+const GOOGLE_DRIVE_SCOPES = (
+  process.env.GOOGLE_DRIVE_SCOPES?.trim() ||
+  "https://www.googleapis.com/auth/drive.readonly"
+)
+  .split(/[\s,]+/)
+  .filter(Boolean);
+const GOOGLE_DRIVE_TOKEN_PATH =
+  process.env.GOOGLE_DRIVE_TOKEN_PATH?.trim() ||
+  path.join(STATE_DIR, "secrets", "google-drive-token.json");
+const GOOGLE_DRIVE_STATE_PATH =
+  process.env.GOOGLE_DRIVE_STATE_PATH?.trim() ||
+  path.join(STATE_DIR, "secrets", "google-drive-oauth-state.json");
+const GOOGLE_DRIVE_MAX_READ_BYTES = Number.parseInt(
+  process.env.GOOGLE_DRIVE_MAX_READ_BYTES || `${5 * 1024 * 1024}`,
+  10,
+);
+
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
 const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
@@ -507,6 +527,252 @@ function requireSetupAuth(req, res, next) {
   return next();
 }
 
+function writeSecureJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  fs.renameSync(tmp, filePath);
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {}
+}
+
+function readJsonIfExists(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+function publicBaseUrl(req) {
+  const configured = process.env.GOOGLE_DRIVE_PUBLIC_BASE_URL?.trim();
+  if (configured) return configured.replace(/\/+$/, "");
+
+  if (process.env.RAILWAY_PUBLIC_DOMAIN?.trim()) {
+    return `https://${process.env.RAILWAY_PUBLIC_DOMAIN.trim()}`;
+  }
+
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "")
+    .split(",")[0]
+    .trim();
+  return `${proto}://${host}`;
+}
+
+function googleDriveRedirectUri(req) {
+  return (
+    process.env.GOOGLE_DRIVE_REDIRECT_URI?.trim() ||
+    `${publicBaseUrl(req)}/setup/google-drive/callback`
+  );
+}
+
+function googleDriveIsConfigured() {
+  return Boolean(GOOGLE_DRIVE_CLIENT_ID && GOOGLE_DRIVE_CLIENT_SECRET);
+}
+
+function googleDriveTokenSummary() {
+  const token = readJsonIfExists(GOOGLE_DRIVE_TOKEN_PATH);
+  if (!token) {
+    return {
+      authorized: false,
+      hasAccessToken: false,
+      hasRefreshToken: false,
+      expiresAt: null,
+      scope: null,
+    };
+  }
+
+  return {
+    authorized: Boolean(token.refresh_token || token.access_token),
+    hasAccessToken: Boolean(token.access_token),
+    hasRefreshToken: Boolean(token.refresh_token),
+    expiresAt: token.expires_at || null,
+    scope: token.scope || null,
+  };
+}
+
+async function googleTokenRequest(params) {
+  const body = new URLSearchParams(params);
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { error: text };
+  }
+  if (!response.ok) {
+    const err = new Error(data.error_description || data.error || response.statusText);
+    err.status = response.status;
+    err.details = data;
+    throw err;
+  }
+  return data;
+}
+
+function persistGoogleDriveToken(previousToken, tokenResponse) {
+  const now = Date.now();
+  const expiresAt = tokenResponse.expires_in
+    ? new Date(now + Number(tokenResponse.expires_in) * 1000).toISOString()
+    : previousToken?.expires_at || null;
+  const merged = {
+    ...previousToken,
+    ...tokenResponse,
+    refresh_token: tokenResponse.refresh_token || previousToken?.refresh_token,
+    obtained_at: new Date(now).toISOString(),
+    expires_at: expiresAt,
+  };
+  writeSecureJson(GOOGLE_DRIVE_TOKEN_PATH, merged);
+  return merged;
+}
+
+async function getGoogleDriveAccessToken() {
+  if (!googleDriveIsConfigured()) {
+    const err = new Error("Google Drive OAuth variables are not configured.");
+    err.status = 400;
+    throw err;
+  }
+
+  const token = readJsonIfExists(GOOGLE_DRIVE_TOKEN_PATH);
+  if (!token) {
+    const err = new Error("Google Drive has not been authorized yet.");
+    err.status = 401;
+    throw err;
+  }
+
+  const expiresAt = token.expires_at ? Date.parse(token.expires_at) : 0;
+  if (token.access_token && (!expiresAt || expiresAt > Date.now() + 60_000)) {
+    return token.access_token;
+  }
+
+  if (!token.refresh_token) {
+    const err = new Error("Google Drive token is expired and has no refresh token.");
+    err.status = 401;
+    throw err;
+  }
+
+  const refreshed = await googleTokenRequest({
+    client_id: GOOGLE_DRIVE_CLIENT_ID,
+    client_secret: GOOGLE_DRIVE_CLIENT_SECRET,
+    refresh_token: token.refresh_token,
+    grant_type: "refresh_token",
+  });
+  return persistGoogleDriveToken(token, refreshed).access_token;
+}
+
+async function googleDriveApi(req, apiPath, searchParams = {}) {
+  const accessToken = await getGoogleDriveAccessToken();
+  const url = new URL(`https://www.googleapis.com/drive/v3/${apiPath}`);
+  for (const [key, value] of Object.entries(searchParams)) {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  const contentType = response.headers.get("content-type") || "";
+  const isJson = contentType.includes("application/json");
+  const body = isJson ? await response.json() : await response.text();
+  if (!response.ok) {
+    const err = new Error(body?.error?.message || body?.error || response.statusText);
+    err.status = response.status;
+    err.details = body;
+    throw err;
+  }
+  return body;
+}
+
+async function googleDriveMedia(req, url) {
+  const accessToken = await getGoogleDriveAccessToken();
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    let message = response.statusText;
+    try {
+      const body = await response.json();
+      message = body?.error?.message || message;
+    } catch {}
+    const err = new Error(message);
+    err.status = response.status;
+    throw err;
+  }
+  const contentLength = Number.parseInt(response.headers.get("content-length") || "0", 10);
+  if (contentLength > GOOGLE_DRIVE_MAX_READ_BYTES) {
+    const err = new Error(
+      `File is too large to read through setup API (${contentLength} bytes).`,
+    );
+    err.status = 413;
+    throw err;
+  }
+  const chunks = [];
+  let total = 0;
+  if (response.body?.getReader) {
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > GOOGLE_DRIVE_MAX_READ_BYTES) {
+        try { await reader.cancel(); } catch {}
+        const err = new Error(
+          `File is too large to read through setup API (${total} bytes).`,
+        );
+        err.status = 413;
+        throw err;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } else {
+    const arrayBuffer = await response.arrayBuffer();
+    total = arrayBuffer.byteLength;
+    chunks.push(Buffer.from(arrayBuffer));
+  }
+
+  if (total > GOOGLE_DRIVE_MAX_READ_BYTES) {
+    const err = new Error(
+      `File is too large to read through setup API (${total} bytes).`,
+    );
+    err.status = 413;
+    throw err;
+  }
+  return {
+    contentType: response.headers.get("content-type") || "application/octet-stream",
+    content: Buffer.concat(chunks, total).toString("utf8"),
+  };
+}
+
+function googleDriveError(res, err) {
+  const status = err.status && err.status >= 400 ? err.status : 500;
+  return res.status(status).json({
+    ok: false,
+    error: err.message || String(err),
+    details: err.details,
+  });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
@@ -602,6 +868,183 @@ app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
     restarted = true;
   }
   res.json({ ok: true, path: p, backupPath, restarted });
+});
+
+app.get("/setup/api/google-drive/status", requireSetupAuth, (req, res) => {
+  res.json({
+    ok: true,
+    configured: googleDriveIsConfigured(),
+    callbackUrl: googleDriveRedirectUri(req),
+    scopes: GOOGLE_DRIVE_SCOPES,
+    tokenPath: GOOGLE_DRIVE_TOKEN_PATH,
+    ...googleDriveTokenSummary(),
+  });
+});
+
+app.post("/setup/api/google-drive/auth-url", requireSetupAuth, (req, res) => {
+  if (!googleDriveIsConfigured()) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Set GOOGLE_DRIVE_CLIENT_ID and GOOGLE_DRIVE_CLIENT_SECRET in Railway Variables first.",
+    });
+  }
+
+  const redirectUri = googleDriveRedirectUri(req);
+  const state = crypto.randomBytes(32).toString("hex");
+  writeSecureJson(GOOGLE_DRIVE_STATE_PATH, {
+    state,
+    redirectUri,
+    createdAt: new Date().toISOString(),
+  });
+
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.searchParams.set("client_id", GOOGLE_DRIVE_CLIENT_ID);
+  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", GOOGLE_DRIVE_SCOPES.join(" "));
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("include_granted_scopes", "true");
+  url.searchParams.set("prompt", "consent");
+  url.searchParams.set("state", state);
+
+  res.json({ ok: true, url: url.href, callbackUrl: redirectUri });
+});
+
+app.get("/setup/google-drive/callback", async (req, res) => {
+  const error = String(req.query.error || "").trim();
+  if (error) {
+    return res
+      .status(400)
+      .type("text/html")
+      .send(`<h1>Google Drive authorization failed</h1><pre>${escapeHtml(error)}</pre>`);
+  }
+
+  const code = String(req.query.code || "").trim();
+  const state = String(req.query.state || "").trim();
+  const expected = readJsonIfExists(GOOGLE_DRIVE_STATE_PATH);
+  const createdAt = expected?.createdAt ? Date.parse(expected.createdAt) : 0;
+  const stateExpired = !createdAt || Date.now() - createdAt > 10 * 60 * 1000;
+
+  if (!code || !state || !expected?.state || state !== expected.state || stateExpired) {
+    return res
+      .status(400)
+      .type("text/html")
+      .send("<h1>Invalid or expired Google Drive OAuth state.</h1>");
+  }
+
+  try {
+    const token = await googleTokenRequest({
+      client_id: GOOGLE_DRIVE_CLIENT_ID,
+      client_secret: GOOGLE_DRIVE_CLIENT_SECRET,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: expected.redirectUri || googleDriveRedirectUri(req),
+    });
+    persistGoogleDriveToken(null, token);
+    try { fs.rmSync(GOOGLE_DRIVE_STATE_PATH, { force: true }); } catch {}
+    log.info("google-drive", "OAuth authorization completed.");
+    return res.type("text/html").send(`
+      <h1>Google Drive connected</h1>
+      <p>Tokens were saved to the Railway volume. You can close this tab and return to OpenClaw setup.</p>
+      <p><a href="/setup">Return to setup</a></p>
+    `);
+  } catch (err) {
+    log.error("google-drive", `OAuth callback failed: ${err.message}`);
+    return res
+      .status(err.status || 500)
+      .type("text/html")
+      .send(
+        `<h1>Google Drive token exchange failed</h1><pre>${escapeHtml(err.message)}</pre>`,
+      );
+  }
+});
+
+app.post("/setup/api/google-drive/disconnect", requireSetupAuth, async (_req, res) => {
+  const token = readJsonIfExists(GOOGLE_DRIVE_TOKEN_PATH);
+  const revokeToken = token?.refresh_token || token?.access_token;
+  if (revokeToken) {
+    try {
+      await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(revokeToken)}`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      });
+    } catch (err) {
+      log.warn("google-drive", `token revoke request failed: ${err.message}`);
+    }
+  }
+  try { fs.rmSync(GOOGLE_DRIVE_TOKEN_PATH, { force: true }); } catch {}
+  try { fs.rmSync(GOOGLE_DRIVE_STATE_PATH, { force: true }); } catch {}
+  res.json({ ok: true });
+});
+
+app.get("/setup/api/google-drive/files", requireSetupAuth, async (req, res) => {
+  const pageSize = Math.min(
+    Math.max(Number.parseInt(req.query.pageSize || "20", 10) || 20, 1),
+    100,
+  );
+  const search = String(req.query.q || "").trim();
+  const rawQuery = String(req.query.rawQ || "").trim();
+  const folderId = String(req.query.folderId || "").trim();
+  const qParts = ["trashed = false"];
+
+  if (folderId) {
+    qParts.push(`'${folderId.replace(/'/g, "\\'")}' in parents`);
+  }
+  if (rawQuery) {
+    qParts.push(`(${rawQuery})`);
+  } else if (search) {
+    const escaped = search.replace(/'/g, "\\'");
+    qParts.push(`(name contains '${escaped}' or fullText contains '${escaped}')`);
+  }
+
+  try {
+    const files = await googleDriveApi(req, "files", {
+      q: qParts.join(" and "),
+      pageSize,
+      pageToken: req.query.pageToken,
+      orderBy: req.query.orderBy || "modifiedTime desc",
+      fields:
+        "nextPageToken,files(id,name,mimeType,modifiedTime,size,webViewLink,parents)",
+      supportsAllDrives: "true",
+      includeItemsFromAllDrives: "true",
+    });
+    res.json({ ok: true, ...files });
+  } catch (err) {
+    googleDriveError(res, err);
+  }
+});
+
+app.get("/setup/api/google-drive/files/:fileId", requireSetupAuth, async (req, res) => {
+  try {
+    const fileId = req.params.fileId;
+    const metadata = await googleDriveApi(req, `files/${encodeURIComponent(fileId)}`, {
+      fields: "id,name,mimeType,modifiedTime,size,webViewLink",
+      supportsAllDrives: "true",
+    });
+
+    if (metadata.mimeType === "application/vnd.google-apps.folder") {
+      return res.status(400).json({ ok: false, error: "Folders cannot be read as files." });
+    }
+
+    const isGoogleDoc = String(metadata.mimeType || "").startsWith(
+      "application/vnd.google-apps.",
+    );
+    const mediaUrl = isGoogleDoc
+      ? `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=text/plain`
+      : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
+    const media = await googleDriveMedia(req, mediaUrl);
+
+    res.json({
+      ok: true,
+      file: metadata,
+      exportMimeType: isGoogleDoc ? "text/plain" : null,
+      contentType: media.contentType,
+      content: media.content,
+    });
+  } catch (err) {
+    googleDriveError(res, err);
+  }
 });
 
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {

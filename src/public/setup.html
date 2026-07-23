@@ -50,6 +50,8 @@
       devices: [],
       devicesPending: [],
       devicesPaired: [],
+      googleDrive: null,
+      googleDriveLoading: false,
 
       get currentGroup() {
         return this.authGroups.find(g => g.value === this.selectedGroup);
@@ -110,6 +112,7 @@
             this.selectedGroup = this.authGroups[0].value;
             this.updateAuthChoices();
           }
+          await this.loadGoogleDriveStatus();
           this.isReady = true;
         } catch (e) {
           this.status = 'Error: ' + String(e);
@@ -263,6 +266,53 @@
           this.log += '✗ Error: ' + String(e) + '\n';
         } finally {
           this.pairingSubmitting = false;
+        }
+      },
+
+      async loadGoogleDriveStatus() {
+        this.googleDriveLoading = true;
+        try {
+          const j = await this.httpJson('/setup/api/google-drive/status');
+          this.googleDrive = j;
+        } catch (e) {
+          this.googleDrive = { ok: false, error: String(e) };
+        } finally {
+          this.googleDriveLoading = false;
+        }
+      },
+
+      async connectGoogleDrive() {
+        this.googleDriveLoading = true;
+        try {
+          const j = await this.httpJson('/setup/api/google-drive/auth-url', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}'
+          });
+          this.log = 'Opening Google Drive authorization. Complete consent, then return to setup.\nCallback URL: ' + (j.callbackUrl || '') + '\n';
+          window.location.href = j.url;
+        } catch (e) {
+          this.log = 'Google Drive authorization failed: ' + String(e.message || e) + '\n';
+        } finally {
+          this.googleDriveLoading = false;
+        }
+      },
+
+      async disconnectGoogleDrive() {
+        if (!confirm('Disconnect Google Drive and remove stored OAuth tokens from this Railway volume?')) return;
+        this.googleDriveLoading = true;
+        try {
+          await this.httpJson('/setup/api/google-drive/disconnect', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}'
+          });
+          this.log = 'Google Drive disconnected and local tokens removed.\n';
+          await this.loadGoogleDriveStatus();
+        } catch (e) {
+          this.log = 'Google Drive disconnect failed: ' + String(e.message || e) + '\n';
+        } finally {
+          this.googleDriveLoading = false;
         }
       },
 
@@ -517,6 +567,37 @@
       <div class="card">
         <h2 class="card-title">Setup Complete</h2>
         <p class="text-muted text-sm">Your OpenClaw instance is configured and running</p>
+      </div>
+
+      <div class="card">
+        <h3 class="card-title" style="font-size:1rem">Google Drive</h3>
+        <p class="card-subtitle">First-party OAuth bridge for Google Drive API access</p>
+        <div class="action-grid">
+          <div class="action-card action-emerald">
+            <div class="action-card-header">
+              <div class="action-icon">
+                <svg class="icon-md" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 11c0-1.105.895-2 2-2h5m-7 2c0 1.105.895 2 2 2h5m-7-2H5a2 2 0 00-2 2v5a2 2 0 002 2h14a2 2 0 002-2v-5a2 2 0 00-2-2m-7 0V5a2 2 0 012-2h3"/></svg>
+              </div>
+              <span class="action-title">Drive OAuth</span>
+            </div>
+            <p class="action-desc" x-show="!googleDrive">Loading Google Drive status...</p>
+            <template x-if="googleDrive">
+              <div>
+                <p class="action-desc" x-show="!googleDrive.configured">Set GOOGLE_DRIVE_CLIENT_ID and GOOGLE_DRIVE_CLIENT_SECRET in Railway Variables first.</p>
+                <p class="action-desc" x-show="googleDrive.configured && !googleDrive.authorized">Google variables are set. Authorize Drive to save tokens on the Railway volume.</p>
+                <p class="action-desc" x-show="googleDrive.configured && googleDrive.authorized">Google Drive is authorized. Tokens are stored on the Railway volume.</p>
+                <p class="text-xs text-muted" style="margin-bottom:0.75rem;word-break:break-all">
+                  Callback: <span x-text="googleDrive.callbackUrl || ''"></span>
+                </p>
+              </div>
+            </template>
+            <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+              <button @click="loadGoogleDriveStatus()" :disabled="googleDriveLoading" class="action-btn" style="flex:1 1 8rem">Refresh</button>
+              <button @click="connectGoogleDrive()" :disabled="googleDriveLoading || !googleDrive || !googleDrive.configured" class="action-btn" style="flex:1 1 8rem">Connect</button>
+              <button @click="disconnectGoogleDrive()" :disabled="googleDriveLoading || !googleDrive || !googleDrive.authorized" class="action-btn" style="flex:1 1 8rem">Disconnect</button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="card">
