@@ -46,6 +46,37 @@ This lets you use a ChatGPT/Codex account or an eligible SuperGrok / X Premium s
 4. Copy the **Bot Token** and paste it into `/setup`
 5. Invite the bot to your server (OAuth2 URL Generator → scopes: `bot`, `applications.commands`; then choose permissions)
 
+### Google Drive OAuth bridge
+
+This template includes a first-party Google Drive OAuth bridge in the wrapper. It does not install a third-party OpenClaw plugin. The bridge is protected by `SETUP_PASSWORD`, stores OAuth tokens on the Railway volume, and starts with read-only Drive scope by default.
+
+1. In Google Cloud Console, create or choose a project.
+2. Enable the **Google Drive API**.
+3. Configure the OAuth consent screen and add your Google account as a test user while unpublished.
+4. Create an OAuth **Web application** client.
+5. Add this authorized redirect URI:
+
+```text
+https://your-app.up.railway.app/setup/google-drive/callback
+```
+
+For this Railway template, set these Railway variables:
+
+```bash
+GOOGLE_DRIVE_CLIENT_ID=...
+GOOGLE_DRIVE_CLIENT_SECRET=...
+GOOGLE_DRIVE_SCOPES=https://www.googleapis.com/auth/drive.readonly
+GOOGLE_DRIVE_TOKEN_PATH=/data/.openclaw/secrets/google-drive-token.json
+```
+
+`GOOGLE_DRIVE_REDIRECT_URI` is optional when `RAILWAY_PUBLIC_DOMAIN` is set. After deploying, use the setup API:
+
+- `GET /setup/api/google-drive/status`
+- `POST /setup/api/google-drive/auth-url`
+- `GET /setup/api/google-drive/files?q=search`
+- `GET /setup/api/google-drive/files/:fileId`
+- `POST /setup/api/google-drive/disconnect`
+
 ## Local testing
 
 ```bash
