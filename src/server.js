@@ -19,6 +19,13 @@ import {
   listBackups,
   resolveBackupPath,
 } from "./storage-backups.js";
+import {
+  createSetupSession,
+  readCookie,
+  safeSetupReturnPath,
+  setupSessionMaxAgeSeconds,
+  verifySetupSession,
+} from "./setup-auth.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
@@ -544,28 +551,34 @@ function requireSetupAuth(req, res, next) {
       );
   }
 
+  const session = readCookie(req.headers.cookie, "openclaw_setup");
+  if (verifySetupSession(session, SETUP_PASSWORD)) {
+    return next();
+  }
+
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme === "Basic" && encoded) {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+    const passwordHash = crypto.createHash("sha256").update(password).digest();
+    const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+    if (crypto.timingSafeEqual(passwordHash, expectedHash)) {
+      return next();
+    }
+  }
+
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
   if (setupRateLimiter.isRateLimited(ip)) {
     return res.status(429).type("text/plain").send("Too many requests. Try again later.");
   }
 
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
+  if (req.method === "GET" && !req.path.startsWith("/setup/api/")) {
+    const nextPath = encodeURIComponent(safeSetupReturnPath(req.originalUrl));
+    return res.redirect(`/setup/login?next=${nextPath}`);
   }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
-  if (!isValid) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
-  }
-  return next();
+  return res.status(401).json({ ok: false, error: "Authentication required" });
 }
 
 function writeSecureJson(filePath, value) {
@@ -817,6 +830,7 @@ function escapeHtml(value) {
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "16kb" }));
 
 app.get("/styles.css", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
@@ -850,6 +864,43 @@ app.get("/setup/healthz", async (_req, res) => {
     gatewayStarting: health.gatewayStarting,
     gatewayReachable: health.gatewayReachable,
   });
+});
+
+app.get("/setup/login", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "login.html"));
+});
+
+app.post("/setup/login", (req, res) => {
+  if (!SETUP_PASSWORD) {
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("SETUP_PASSWORD is not set in Railway Variables.");
+  }
+
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  if (setupRateLimiter.isRateLimited(ip)) {
+    return res.status(429).type("text/plain").send("Too many requests. Try again later.");
+  }
+
+  const suppliedHash = crypto
+    .createHash("sha256")
+    .update(String(req.body.password || ""))
+    .digest();
+  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+  const nextPath = safeSetupReturnPath(req.body.next);
+  if (!crypto.timingSafeEqual(suppliedHash, expectedHash)) {
+    return res.redirect(
+      `/setup/login?error=1&next=${encodeURIComponent(nextPath)}`,
+    );
+  }
+
+  const session = createSetupSession(SETUP_PASSWORD);
+  res.setHeader(
+    "Set-Cookie",
+    `openclaw_setup=${encodeURIComponent(session)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${setupSessionMaxAgeSeconds}`,
+  );
+  return res.redirect(nextPath);
 });
 
 app.get("/setup", requireSetupAuth, (_req, res) => {

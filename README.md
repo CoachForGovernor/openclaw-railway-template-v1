@@ -16,7 +16,7 @@
 ## How it works (high level)
 
 - The container runs a wrapper web server.
-- The wrapper protects `/setup` with `SETUP_PASSWORD`.
+- The wrapper protects `/setup` with `SETUP_PASSWORD`. Browser visits use a password form and secure 12-hour session cookie; HTTP Basic authentication remains available for command-line access.
 - During setup, the wrapper runs `openclaw onboard ...` inside the container, writes state to the volume, and then starts the gateway. API-key providers use non-interactive setup. Interactive device-code logins (ChatGPT/Codex, xAI/Grok) can't run from the web wizard — complete those by running `openclaw wizard` in the Railway console.
 - After setup, **`/` is OpenClaw**. The wrapper reverse-proxies all traffic (including WebSockets) to the local gateway process.
 
