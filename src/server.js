@@ -12,6 +12,13 @@ import {
   canServeGatewayRequest,
   describeGatewayHealth,
 } from "./gateway-readiness.js";
+import {
+  createCriticalBackup,
+  deleteBackup,
+  getVolumeUsage,
+  listBackups,
+  resolveBackupPath,
+} from "./storage-backups.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
@@ -20,6 +27,24 @@ const STATE_DIR =
 const WORKSPACE_DIR =
   process.env.OPENCLAW_WORKSPACE_DIR?.trim() ||
   path.join(STATE_DIR, "workspace");
+const VOLUME_ROOT =
+  process.env.OPENCLAW_VOLUME_ROOT?.trim() ||
+  (path.resolve(STATE_DIR).startsWith(`${path.resolve("/data")}${path.sep}`)
+    ? "/data"
+    : path.dirname(path.resolve(STATE_DIR)));
+const BACKUP_DIR =
+  process.env.OPENCLAW_BACKUP_DIR?.trim() ||
+  path.join(VOLUME_ROOT, "backups");
+const CRITICAL_BACKUP_RETENTION = Math.max(
+  1,
+  Math.min(
+    10,
+    Number.parseInt(
+      process.env.OPENCLAW_CRITICAL_BACKUP_RETENTION || "1",
+      10,
+    ) || 1,
+  ),
+);
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
@@ -468,6 +493,22 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+async function stopGatewayForSnapshot() {
+  if (gatewayProc) {
+    try {
+      gatewayProc.kill("SIGTERM");
+    } catch (err) {
+      log.warn("storage", `gateway stop signal failed: ${err.message}`);
+    }
+    await sleep(750);
+    gatewayProc = null;
+  }
+  const result = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+  if (result.code !== 0) {
+    log.warn("storage", `gateway stop command exited ${result.code}`);
+  }
+}
+
 const setupRateLimiter = {
   attempts: new Map(),
   windowMs: 60_000,
@@ -818,6 +859,161 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 app.get("/setup/config", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "config.html"));
 });
+
+app.get("/setup/storage", requireSetupAuth, (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "storage.html"));
+});
+
+let storageBackupInProgress = false;
+
+function storageStatus() {
+  const volume = getVolumeUsage(VOLUME_ROOT);
+  const backups = listBackups(BACKUP_DIR);
+  const backupBytes = backups.reduce(
+    (total, backup) => total + backup.sizeBytes,
+    0,
+  );
+  return {
+    ok: true,
+    volumeRoot: VOLUME_ROOT,
+    backupDir: BACKUP_DIR,
+    volume,
+    backups,
+    backupBytes,
+    liveBytes: Math.max(0, volume.usedBytes - backupBytes),
+    criticalRetention: CRITICAL_BACKUP_RETENTION,
+    backupInProgress: storageBackupInProgress,
+  };
+}
+
+app.get("/setup/api/storage", requireSetupAuth, (_req, res) => {
+  try {
+    return res.json(storageStatus());
+  } catch (err) {
+    log.error("storage", `status failed: ${err.message}`);
+    return res
+      .status(500)
+      .json({ ok: false, error: `Storage status failed: ${err.message}` });
+  }
+});
+
+app.post(
+  "/setup/api/storage/backups/critical",
+  requireSetupAuth,
+  async (_req, res) => {
+    if (storageBackupInProgress) {
+      return res
+        .status(409)
+        .json({ ok: false, error: "A critical backup is already running." });
+    }
+
+    storageBackupInProgress = true;
+    const shouldRestart = isConfigured();
+    let backup = null;
+    let operationError = null;
+    let restartError = null;
+    try {
+      if (shouldRestart) {
+        intentionalRestart = true;
+        await stopGatewayForSnapshot();
+      }
+      let openclawVersion = null;
+      try {
+        openclawVersion = (await getOpenclawInfo()).version;
+      } catch {}
+      backup = await createCriticalBackup({
+        backupDir: BACKUP_DIR,
+        configPath: configPath(),
+        openclawVersion,
+        retention: CRITICAL_BACKUP_RETENTION,
+        stateDir: STATE_DIR,
+        volumeRoot: VOLUME_ROOT,
+        workspaceDir: WORKSPACE_DIR,
+      });
+      log.info(
+        "storage",
+        `created critical backup ${backup.name} (${backup.sizeBytes} bytes)`,
+      );
+    } catch (err) {
+      operationError = err;
+      log.error("storage", `critical backup failed: ${err.message}`);
+    } finally {
+      if (shouldRestart) {
+        intentionalRestart = false;
+        try {
+          await ensureGatewayRunning();
+        } catch (err) {
+          restartError = err;
+          log.error(
+            "storage",
+            `gateway restart after backup failed: ${err.message}`,
+          );
+        }
+      }
+      storageBackupInProgress = false;
+    }
+
+    if (operationError) {
+      return res.status(500).json({
+        ok: false,
+        error: `Critical backup failed: ${operationError.message}`,
+        gatewayRestarted: !restartError,
+      });
+    }
+    if (restartError) {
+      return res.status(500).json({
+        ok: false,
+        error: `Backup was created, but the gateway restart failed: ${restartError.message}`,
+        backup,
+        gatewayRestarted: false,
+      });
+    }
+    return res.json({
+      ...storageStatus(),
+      backup,
+      gatewayRestarted: shouldRestart,
+    });
+  },
+);
+
+app.get(
+  "/setup/api/storage/backups/:name/download",
+  requireSetupAuth,
+  (req, res) => {
+    try {
+      const filePath = resolveBackupPath(BACKUP_DIR, req.params.name);
+      if (!fs.existsSync(filePath) || !fs.lstatSync(filePath).isFile()) {
+        return res.status(404).json({ ok: false, error: "Backup not found." });
+      }
+      return res.download(filePath, req.params.name);
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+  },
+);
+
+app.delete(
+  "/setup/api/storage/backups/:name",
+  requireSetupAuth,
+  (req, res) => {
+    if (storageBackupInProgress) {
+      return res
+        .status(409)
+        .json({ ok: false, error: "A critical backup is currently running." });
+    }
+    try {
+      const removed = deleteBackup(BACKUP_DIR, req.params.name);
+      log.info(
+        "storage",
+        `deleted backup ${removed.name} (${removed.sizeBytes} bytes)`,
+      );
+      return res.json({ ...storageStatus(), removed });
+    } catch (err) {
+      const status = err.code === "ENOENT" ? 404 : 400;
+      return res.status(status).json({ ok: false, error: err.message });
+    }
+  },
+);
 
 app.get("/setup/api/config/raw", requireSetupAuth, (_req, res) => {
   const p = configPath();

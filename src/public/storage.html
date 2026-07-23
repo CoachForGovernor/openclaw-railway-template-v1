@@ -1,0 +1,283 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw - Storage & Backups</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script>
+  document.addEventListener('alpine:init', () => {
+    Alpine.data('storageApp', () => ({
+      loading: true,
+      creating: false,
+      deleting: '',
+      error: '',
+      message: '',
+      status: null,
+
+      async init() {
+        await this.load();
+      },
+
+      async httpJson(url, opts = {}) {
+        opts.credentials = 'same-origin';
+        const res = await fetch(url, opts);
+        const text = await res.text();
+        let body = null;
+        try { body = text ? JSON.parse(text) : null; } catch { /* leave null */ }
+        if (!res.ok) {
+          throw new Error((body && body.error) || text || res.statusText);
+        }
+        return body;
+      },
+
+      async load() {
+        this.loading = true;
+        this.error = '';
+        try {
+          this.status = await this.httpJson('/setup/api/storage');
+        } catch (e) {
+          this.error = String(e.message || e);
+        } finally {
+          this.loading = false;
+        }
+      },
+
+      formatBytes(bytes) {
+        const value = Number(bytes || 0);
+        if (value < 1000) return value + ' B';
+        const units = ['KB', 'MB', 'GB', 'TB'];
+        let scaled = value;
+        for (const unit of units) {
+          scaled /= 1000;
+          if (scaled < 1000 || unit === units[units.length - 1]) {
+            return scaled.toFixed(scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2) + ' ' + unit;
+          }
+        }
+        return value + ' B';
+      },
+
+      formatDate(value) {
+        return value ? new Date(value).toLocaleString() : '';
+      },
+
+      backupLabel(type) {
+        return {
+          critical: 'Critical state',
+          rollback: 'Full rollback',
+          export: 'Data export',
+          other: 'Other',
+        }[type] || 'Other';
+      },
+
+      get usageLevel() {
+        const percent = Number(this.status?.volume?.percentUsed || 0);
+        if (percent >= 80) return 'high';
+        if (percent >= 65) return 'watch';
+        return 'healthy';
+      },
+
+      async createCritical() {
+        if (this.creating) return;
+        const retention = this.status?.criticalRetention || 1;
+        if (!confirm(
+          'Create a consistent critical-state backup now? The OpenClaw gateway will pause briefly. ' +
+          'After verification, only the newest ' + retention + ' critical backup will be retained.'
+        )) return;
+
+        this.creating = true;
+        this.error = '';
+        this.message = 'Creating and verifying critical backup...';
+        try {
+          const result = await this.httpJson('/setup/api/storage/backups/critical', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}',
+          });
+          this.status = result;
+          this.message = 'Critical backup created: ' + result.backup.name +
+            ' (' + this.formatBytes(result.backup.sizeBytes) + ').';
+        } catch (e) {
+          this.error = String(e.message || e);
+          this.message = '';
+          await this.load();
+        } finally {
+          this.creating = false;
+        }
+      },
+
+      async removeBackup(backup) {
+        if (this.deleting || this.creating) return;
+        if (!confirm(
+          'Permanently delete ' + backup.name + ' (' + this.formatBytes(backup.sizeBytes) + ')?'
+        )) return;
+
+        this.deleting = backup.name;
+        this.error = '';
+        this.message = '';
+        try {
+          const result = await this.httpJson(
+            '/setup/api/storage/backups/' + encodeURIComponent(backup.name),
+            { method: 'DELETE' }
+          );
+          this.status = result;
+          this.message = 'Deleted ' + result.removed.name + ' and recovered ' +
+            this.formatBytes(result.removed.sizeBytes) + '.';
+        } catch (e) {
+          this.error = String(e.message || e);
+        } finally {
+          this.deleting = '';
+        }
+      },
+    }));
+  });
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+</head>
+<body x-data="storageApp()">
+  <div class="container storage-container">
+    <div class="logo-wrap">
+      <picture>
+        <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text-dark.png">
+        <img src="https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text.png" alt="OpenClaw" class="logo-img">
+      </picture>
+    </div>
+
+    <div class="page-toolbar">
+      <a href="/setup" class="inline-link">
+        <svg class="icon-sm" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+        Setup
+      </a>
+      <button @click="load()" :disabled="loading || creating || deleting" class="btn-icon" title="Refresh storage status" aria-label="Refresh storage status">
+        <svg class="icon-sm" :class="loading && 'spinning'" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+      </button>
+    </div>
+
+    <div class="card">
+      <div class="card-header storage-header">
+        <div>
+          <h1 class="card-title">Storage &amp; Backups</h1>
+          <p class="card-subtitle">Persistent volume status and restore points</p>
+        </div>
+        <span
+          x-show="status"
+          class="storage-health"
+          :class="'storage-health-' + usageLevel"
+          x-text="Math.round(status?.volume?.percentUsed || 0) + '% used'"
+        ></span>
+      </div>
+
+      <div x-show="loading && !status" class="empty-state">Loading volume status...</div>
+      <div x-show="error" x-cloak class="setup-error-panel" x-text="error"></div>
+      <div x-show="message" x-cloak class="storage-message" x-text="message"></div>
+
+      <template x-if="status">
+        <div>
+          <div class="storage-meter" :class="'storage-meter-' + usageLevel">
+            <div
+              class="storage-meter-fill"
+              :style="'width:' + Math.min(100, status.volume.percentUsed) + '%'"
+            ></div>
+          </div>
+
+          <dl class="storage-metrics">
+            <div>
+              <dt>Used</dt>
+              <dd x-text="formatBytes(status.volume.usedBytes)"></dd>
+            </div>
+            <div>
+              <dt>Live system</dt>
+              <dd x-text="formatBytes(status.liveBytes)"></dd>
+            </div>
+            <div>
+              <dt>Backups</dt>
+              <dd x-text="formatBytes(status.backupBytes)"></dd>
+            </div>
+            <div>
+              <dt>Available</dt>
+              <dd x-text="formatBytes(status.volume.availableBytes)"></dd>
+            </div>
+            <div>
+              <dt>Capacity</dt>
+              <dd x-text="formatBytes(status.volume.totalBytes)"></dd>
+            </div>
+          </dl>
+
+          <div class="storage-paths">
+            <p><span>Volume</span><code x-text="status.volumeRoot"></code></p>
+            <p><span>Backups</span><code x-text="status.backupDir"></code></p>
+          </div>
+
+          <section class="storage-section">
+            <div class="storage-section-header">
+              <div>
+                <h2>Critical Restore Point</h2>
+                <p>Settings, agents, sessions, memory, credentials, authorizations, and workspace. Reproducible packages and caches are excluded.</p>
+              </div>
+              <button
+                @click="createCritical()"
+                :disabled="creating || deleting"
+                class="btn btn-primary storage-create"
+              >
+                <span x-show="!creating">Create / Replace</span>
+                <span x-show="creating" style="display:inline-flex;align-items:center;gap:0.5rem">
+                  <span class="spinner spinner-inline" aria-hidden="true"></span>
+                  Creating
+                </span>
+              </button>
+            </div>
+          </section>
+
+          <section class="storage-section">
+            <div class="storage-section-header">
+              <div>
+                <h2>Backups</h2>
+                <p x-text="status.backups.length + (status.backups.length === 1 ? ' archive' : ' archives')"></p>
+              </div>
+            </div>
+
+            <div x-show="status.backups.length === 0" class="empty-state">No backups on this volume</div>
+            <div class="backup-list">
+              <template x-for="backup in status.backups" :key="backup.name">
+                <div class="backup-row">
+                  <div class="backup-main">
+                    <div class="backup-title-row">
+                      <span class="backup-type" :class="'backup-type-' + backup.type" x-text="backupLabel(backup.type)"></span>
+                      <strong x-text="formatBytes(backup.sizeBytes)"></strong>
+                    </div>
+                    <code x-text="backup.name"></code>
+                    <time x-text="formatDate(backup.modifiedAt)"></time>
+                  </div>
+                  <div class="backup-actions">
+                    <a
+                      :href="'/setup/api/storage/backups/' + encodeURIComponent(backup.name) + '/download'"
+                      class="btn-icon"
+                      title="Download backup"
+                      aria-label="Download backup"
+                    >
+                      <svg class="icon-sm" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v12m0 0l-4-4m4 4l4-4M5 20h14"/></svg>
+                    </a>
+                    <button
+                      @click="removeBackup(backup)"
+                      :disabled="creating || deleting"
+                      class="btn-icon btn-icon-danger"
+                      title="Delete backup"
+                      aria-label="Delete backup"
+                    >
+                      <svg class="icon-sm" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 7h12m-9 0V5h6v2m-8 0l1 13h8l1-13M10 11v5m4-5v5"/></svg>
+                    </button>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </section>
+
+          <p class="storage-footnote">
+            Critical snapshots contain credentials. Downloaded copies should be encrypted before off-volume storage.
+          </p>
+        </div>
+      </template>
+    </div>
+  </div>
+</body>
+</html>

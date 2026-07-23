@@ -10,6 +10,7 @@
 
 - **OpenClaw Gateway + Control UI** (served at `/` and `/openclaw`)
 - A friendly **Setup Wizard** at `/setup` (protected by a password)
+- **Storage & Backup Manager** at `/setup/storage`
 - Persistent state via **Railway Volume** (so config/credentials/memory survive redeploys)
 
 ## How it works (high level)
@@ -76,6 +77,29 @@ GOOGLE_DRIVE_TOKEN_PATH=/data/.openclaw/secrets/google-drive-token.json
 - `GET /setup/api/google-drive/files?q=search`
 - `GET /setup/api/google-drive/files/:fileId`
 - `POST /setup/api/google-drive/disconnect`
+
+## Storage and backups
+
+The password-protected `/setup/storage` page reports live filesystem usage,
+separates backup storage from the running system, and lists archives stored in
+`/data/backups`.
+
+The **Create / Replace** action maintains one verified critical-state archive.
+It briefly pauses the gateway for a consistent snapshot and includes settings,
+agents, sessions, memory, credentials, authorizations, and workspace data. It
+excludes reproducible npm packages, downloaded tools, logs, caches, Linuxbrew,
+and prior backups.
+
+Optional variables:
+
+```bash
+OPENCLAW_VOLUME_ROOT=/data
+OPENCLAW_BACKUP_DIR=/data/backups
+OPENCLAW_CRITICAL_BACKUP_RETENTION=1
+```
+
+Critical archives contain credentials. Protect downloaded copies and encrypt
+them before storing them outside Railway.
 
 ## Local testing
 
